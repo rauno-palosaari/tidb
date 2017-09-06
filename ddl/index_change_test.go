@@ -116,6 +116,9 @@ func (s *testIndexChangeSuite) TestIndexChange(c *C) {
 			}
 			writeReorgStartVal += writeReorgStep
 		case model.StatePublic:
+			// 3 is the row count before writeReorgTable add records. So 3 lines need to be inserted indexes.
+			// The first time worker enters the StateWriteReorganization state will insert writeReorgStep lines of data,
+			// and then get the current version as snapshot version. So a writeReorgStep need to be inserted indexes too.
 			reorgRows := 3 + int64(writeReorgStep)
 			if job.GetRowCount() != reorgRows {
 				checkErr = errors.Errorf("job's row count %d != %d", job.GetRowCount(), reorgRows)
