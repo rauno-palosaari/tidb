@@ -47,10 +47,12 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
+	"github.com/pingcap/tidb/driver"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/arena"
 	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/hack"
@@ -62,9 +64,9 @@ var defaultCapability = mysql.ClientLongPassword | mysql.ClientLongFlag |
 	mysql.ClientMultiResults | mysql.ClientLocalFiles |
 	mysql.ClientConnectAtts | mysql.ClientPluginAuth
 
-// clientConn represents a connection between server and client, it maintains connection specific state,
+// mysqlClientConn represents a connection between server and client, it maintains connection specific state,
 // handles client query.
-type clientConn struct {
+type mysqlClientConn struct {
 	pkt          *packetIO // a helper to read and write data in packet format.
 	conn         net.Conn
 	server       *Server           // a reference of server instance.
@@ -76,12 +78,12 @@ type clientConn struct {
 	salt         []byte            // random bytes used for authentication.
 	alloc        arena.Allocator   // an memory allocator for reducing memory allocation.
 	lastCmd      string            // latest sql query string, currently used for logging error.
-	ctx          QueryCtx          // an interface to execute sql statements.
+	ctx          driver.QueryCtx          // an interface to execute sql statements.
 	attrs        map[string]string // attributes parsed from client handshake response, not used for now.
 	killed       bool
 }
 
-func (cc *clientConn) String() string {
+func (cc *mysqlClientConn) String() string {
 	collationStr := mysql.Collations[cc.collation]
 	return fmt.Sprintf("id:%d, addr:%s status:%d, collation:%s, user:%s",
 		cc.connectionID, cc.conn.RemoteAddr(), cc.ctx.Status(), collationStr, cc.user,
@@ -91,7 +93,7 @@ func (cc *clientConn) String() string {
 // handshake works like TCP handshake, but in a higher level, it first writes initial packet to client,
 // during handshake, client and server negotiate compatible features and do authentication.
 // After handshake, client can send sql query to server.
-func (cc *clientConn) handshake() error {
+func (cc *mysqlClientConn) handshake() error {
 	if err := cc.writeInitialHandshake(); err != nil {
 		return errors.Trace(err)
 	}
@@ -103,7 +105,7 @@ func (cc *clientConn) handshake() error {
 	data = append(data, mysql.OKHeader)
 	data = append(data, 0, 0)
 	if cc.capability&mysql.ClientProtocol41 > 0 {
-		data = append(data, dumpUint16(mysql.ServerStatusAutocommit)...)
+		data = append(data, driver.DumpUint16(mysql.ServerStatusAutocommit)...)
 		data = append(data, 0, 0)
 	}
 
@@ -116,7 +118,7 @@ func (cc *clientConn) handshake() error {
 	return errors.Trace(cc.flush())
 }
 
-func (cc *clientConn) Close() error {
+func (cc *mysqlClientConn) Close() error {
 	cc.server.rwlock.Lock()
 	delete(cc.server.clients, cc.connectionID)
 	connections := len(cc.server.clients)
@@ -131,7 +133,7 @@ func (cc *clientConn) Close() error {
 
 // writeInitialHandshake sends server version, connection ID, server capability, collation, server status
 // and auth salt to the client.
-func (cc *clientConn) writeInitialHandshake() error {
+func (cc *mysqlClientConn) writeInitialHandshake() error {
 	data := make([]byte, 4, 128)
 
 	// min version 10
@@ -150,7 +152,7 @@ func (cc *clientConn) writeInitialHandshake() error {
 	// charset, utf-8 default
 	data = append(data, uint8(mysql.DefaultCollationID))
 	//status
-	data = append(data, dumpUint16(mysql.ServerStatusAutocommit)...)
+	data = append(data, driver.DumpUint16(mysql.ServerStatusAutocommit)...)
 	// below 13 byte may not be used
 	// capability flag upper 2 bytes, using default capability here
 	data = append(data, byte(defaultCapability>>16), byte(defaultCapability>>24))
@@ -172,11 +174,11 @@ func (cc *clientConn) writeInitialHandshake() error {
 	return errors.Trace(cc.flush())
 }
 
-func (cc *clientConn) readPacket() ([]byte, error) {
+func (cc *mysqlClientConn) readPacket() ([]byte, error) {
 	return cc.pkt.readPacket()
 }
 
-func (cc *clientConn) writePacket(data []byte) error {
+func (cc *mysqlClientConn) writePacket(data []byte) error {
 	return cc.pkt.writePacket(data)
 }
 
@@ -217,7 +219,7 @@ func handshakeResponseFromData(packet *handshakeResponse41, data []byte) (err er
 		// MySQL client sets the wrong capability, it will set this bit even server doesn't
 		// support ClientPluginAuthLenencClientData.
 		// https://github.com/mysql/mysql-server/blob/5.7/sql-common/client.c#L3478
-		num, null, off := parseLengthEncodedInt(data[pos:])
+		num, null, off := driver.ParseLengthEncodedInt(data[pos:])
 		pos += off
 		if !null {
 			packet.Auth = data[pos : pos+int(num)]
@@ -253,7 +255,7 @@ func handshakeResponseFromData(packet *handshakeResponse41, data []byte) (err er
 			// Defend some ill-formated packet, connection attribute is not important and can be ignored.
 			return nil
 		}
-		if num, null, off := parseLengthEncodedInt(data[pos:]); !null {
+		if num, null, off := driver.ParseLengthEncodedInt(data[pos:]); !null {
 			pos += off
 			kv := data[pos : pos+int(num)]
 			attrs, err := parseAttrs(kv)
@@ -272,12 +274,12 @@ func parseAttrs(data []byte) (map[string]string, error) {
 	attrs := make(map[string]string)
 	pos := 0
 	for pos < len(data) {
-		key, _, off, err := parseLengthEncodedBytes(data[pos:])
+		key, _, off, err := driver.ParseLengthEncodedBytes(data[pos:])
 		if err != nil {
 			return attrs, errors.Trace(err)
 		}
 		pos += off
-		value, _, off, err := parseLengthEncodedBytes(data[pos:])
+		value, _, off, err := driver.ParseLengthEncodedBytes(data[pos:])
 		if err != nil {
 			return attrs, errors.Trace(err)
 		}
@@ -288,7 +290,7 @@ func parseAttrs(data []byte) (map[string]string, error) {
 	return attrs, nil
 }
 
-func (cc *clientConn) readHandshakeResponse() error {
+func (cc *mysqlClientConn) readHandshakeResponse() error {
 	data, err := cc.readPacket()
 	if err != nil {
 		return errors.Trace(err)
@@ -333,7 +335,7 @@ func (cc *clientConn) readHandshakeResponse() error {
 // Run reads client query and writes query result to client in for loop, if there is a panic during query handling,
 // it will be recovered and log the panic error.
 // This function returns and the connection is closed if there is an IO error or there is a panic.
-func (cc *clientConn) Run() {
+func (cc *mysqlClientConn) Run() {
 	const size = 4096
 	defer func() {
 		r := recover()
@@ -404,7 +406,7 @@ func errStrForLog(err error) string {
 	return errors.ErrorStack(err)
 }
 
-func (cc *clientConn) addMetrics(cmd byte, startTime time.Time, err error) {
+func (cc *mysqlClientConn) addMetrics(cmd byte, startTime time.Time, err error) {
 	var label string
 	switch cmd {
 	case mysql.ComSleep:
@@ -445,7 +447,7 @@ func (cc *clientConn) addMetrics(cmd byte, startTime time.Time, err error) {
 // dispatch handles client request based on command which is the first byte of the data.
 // It also gets a token from server which is used to limit the concurrently handling clients.
 // The most frequently used command is ComQuery.
-func (cc *clientConn) dispatch(data []byte) error {
+func (cc *mysqlClientConn) dispatch(data []byte) error {
 	cmd := data[0]
 	data = data[1:]
 	cc.lastCmd = hack.String(data)
@@ -497,7 +499,7 @@ func (cc *clientConn) dispatch(data []byte) error {
 	}
 }
 
-func (cc *clientConn) useDB(db string) (err error) {
+func (cc *mysqlClientConn) useDB(db string) (err error) {
 	// if input is "use `SELECT`", mysql client just send "SELECT"
 	// so we add `` around db.
 	_, err = cc.ctx.Execute("use `" + db + "`")
@@ -508,18 +510,18 @@ func (cc *clientConn) useDB(db string) (err error) {
 	return
 }
 
-func (cc *clientConn) flush() error {
+func (cc *mysqlClientConn) flush() error {
 	return cc.pkt.flush()
 }
 
-func (cc *clientConn) writeOK() error {
+func (cc *mysqlClientConn) writeOK() error {
 	data := cc.alloc.AllocWithLen(4, 32)
 	data = append(data, mysql.OKHeader)
-	data = append(data, dumpLengthEncodedInt(uint64(cc.ctx.AffectedRows()))...)
-	data = append(data, dumpLengthEncodedInt(uint64(cc.ctx.LastInsertID()))...)
+	data = append(data, driver.DumpLengthEncodedInt(uint64(cc.ctx.AffectedRows()))...)
+	data = append(data, driver.DumpLengthEncodedInt(uint64(cc.ctx.LastInsertID()))...)
 	if cc.capability&mysql.ClientProtocol41 > 0 {
-		data = append(data, dumpUint16(cc.ctx.Status())...)
-		data = append(data, dumpUint16(cc.ctx.WarningCount())...)
+		data = append(data, driver.DumpUint16(cc.ctx.Status())...)
+		data = append(data, driver.DumpUint16(cc.ctx.WarningCount())...)
 	}
 
 	err := cc.writePacket(data)
@@ -530,7 +532,7 @@ func (cc *clientConn) writeOK() error {
 	return errors.Trace(cc.flush())
 }
 
-func (cc *clientConn) writeError(e error) error {
+func (cc *mysqlClientConn) writeError(e error) error {
 	var (
 		m  *mysql.SQLError
 		te *terror.Error
@@ -565,24 +567,24 @@ func (cc *clientConn) writeError(e error) error {
 // packets following it, the "more" argument would indicates that case.
 // If "more" is true, a mysql.ServerMoreResultsExists bit would be set
 // in the packet.
-func (cc *clientConn) writeEOF(more bool) error {
+func (cc *mysqlClientConn) writeEOF(more bool) error {
 	data := cc.alloc.AllocWithLen(4, 9)
 
 	data = append(data, mysql.EOFHeader)
 	if cc.capability&mysql.ClientProtocol41 > 0 {
-		data = append(data, dumpUint16(cc.ctx.WarningCount())...)
+		data = append(data, driver.DumpUint16(cc.ctx.WarningCount())...)
 		status := cc.ctx.Status()
 		if more {
 			status |= mysql.ServerMoreResultsExists
 		}
-		data = append(data, dumpUint16(cc.ctx.Status())...)
+		data = append(data, driver.DumpUint16(cc.ctx.Status())...)
 	}
 
 	err := cc.writePacket(data)
 	return errors.Trace(err)
 }
 
-func (cc *clientConn) writeReq(filePath string) error {
+func (cc *mysqlClientConn) writeReq(filePath string) error {
 	data := cc.alloc.AllocWithLen(4, 5+len(filePath))
 	data = append(data, mysql.LocalInFileHeader)
 	data = append(data, filePath...)
@@ -620,7 +622,7 @@ func insertDataWithCommit(prevData, curData []byte, loadDataInfo *executor.LoadD
 
 // handleLoadData does the additional work after processing the 'load data' query.
 // It sends client a file path, then reads the file content from client, inserts data into database.
-func (cc *clientConn) handleLoadData(loadDataInfo *executor.LoadDataInfo) error {
+func (cc *mysqlClientConn) handleLoadData(loadDataInfo *executor.LoadDataInfo) error {
 	// If the server handles the load data request, the client has to set the ClientLocalFiles capability.
 	if cc.capability&mysql.ClientLocalFiles == 0 {
 		return errNotAllowedCommand
@@ -680,7 +682,7 @@ func (cc *clientConn) handleLoadData(loadDataInfo *executor.LoadDataInfo) error 
 // handleQuery executes the sql query string and writes result set or result ok to the client.
 // As the execution time of this function represents the performance of TiDB, we do time log and metrics here.
 // There is a special query `load data` that does not return result, which is handled differently.
-func (cc *clientConn) handleQuery(sql string) (err error) {
+func (cc *mysqlClientConn) handleQuery(sql string) (err error) {
 	rs, err := cc.ctx.Execute(sql)
 	if err != nil {
 		executeErrorCounter.WithLabelValues(executeErrorToLabel(err)).Inc()
@@ -707,7 +709,7 @@ func (cc *clientConn) handleQuery(sql string) (err error) {
 
 // handleFieldList returns the field list for a table.
 // The sql string is composed of a table name and a terminating character \x00.
-func (cc *clientConn) handleFieldList(sql string) (err error) {
+func (cc *mysqlClientConn) handleFieldList(sql string) (err error) {
 	parts := strings.Split(sql, "\x00")
 	columns, err := cc.ctx.FieldList(parts[0])
 	if err != nil {
@@ -731,7 +733,7 @@ func (cc *clientConn) handleFieldList(sql string) (err error) {
 // If binary is true, the data would be encoded in BINARY format.
 // If more is true, a flag bit would be set to indicate there are more
 // resultsets, it's used to support the MULTI_RESULTS capability in mysql protocol.
-func (cc *clientConn) writeResultset(rs ResultSet, binary bool, more bool) error {
+func (cc *mysqlClientConn) writeResultset(rs driver.ResultSet, binary bool, more bool) error {
 	defer rs.Close()
 	// We need to call Next before we get columns.
 	// Otherwise, we will get incorrect columns info.
@@ -745,7 +747,7 @@ func (cc *clientConn) writeResultset(rs ResultSet, binary bool, more bool) error
 		return errors.Trace(err)
 	}
 
-	columnLen := dumpLengthEncodedInt(uint64(len(columns)))
+	columnLen := driver.DumpLengthEncodedInt(uint64(len(columns)))
 	data := cc.alloc.AllocWithLen(4, 1024)
 	data = append(data, columnLen...)
 	if err = cc.writePacket(data); err != nil {
@@ -774,7 +776,7 @@ func (cc *clientConn) writeResultset(rs ResultSet, binary bool, more bool) error
 		data = data[0:4]
 		if binary {
 			var rowData []byte
-			rowData, err = dumpRowValuesBinary(cc.alloc, columns, row)
+			rowData, err = driver.DumpRowValuesBinary(cc.alloc, columns, row)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -790,7 +792,7 @@ func (cc *clientConn) writeResultset(rs ResultSet, binary bool, more bool) error
 				if err != nil {
 					return errors.Trace(err)
 				}
-				data = append(data, dumpLengthEncodedString(valData, cc.alloc)...)
+				data = append(data, driver.DumpLengthEncodedString(valData, cc.alloc)...)
 			}
 		}
 
@@ -808,11 +810,30 @@ func (cc *clientConn) writeResultset(rs ResultSet, binary bool, more bool) error
 	return errors.Trace(cc.flush())
 }
 
-func (cc *clientConn) writeMultiResultset(rss []ResultSet, binary bool) error {
+func (cc *mysqlClientConn) writeMultiResultset(rss []driver.ResultSet, binary bool) error {
 	for _, rs := range rss {
 		if err := cc.writeResultset(rs, binary, true); err != nil {
 			return errors.Trace(err)
 		}
 	}
 	return cc.writeOK()
+}
+
+func (cc *mysqlClientConn) isKilled() bool {
+	return cc.killed
+}
+
+func (cc *mysqlClientConn) Cancel(query bool) {
+	cc.ctx.Cancel()
+	if !query {
+		cc.killed = true
+	}
+}
+
+func (cc *mysqlClientConn) id() uint32 {
+	return cc.connectionID
+}
+
+func (cc *mysqlClientConn) showProcess() util.ProcessInfo {
+	return cc.ctx.ShowProcess()
 }

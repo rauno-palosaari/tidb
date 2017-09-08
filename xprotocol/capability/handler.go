@@ -11,12 +11,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package xserver
+package capability
 
-// Config contains configuration options.
-type Config struct {
-	Addr     string `json:"addr" toml:"addr"`
-	Socket   string `json:"socket" toml:"socket"`
-	LogLevel string `json:"log_level" toml:"log_level"`
-	SkipAuth bool   `json:"skip_auth" toml:"skip_auth"`
+import (
+	"github.com/pingcap/tipb/go-mysqlx/Connection"
+	"github.com/pingcap/tipb/go-mysqlx/Datatypes"
+)
+
+// Handler is capability handler.
+type Handler interface {
+	// IsSupport returns whether this capability is supported.
+	IsSupport() bool
+	// GetName gets capability name.
+	GetName() string
+	// Get gets capability.
+	Get() *Mysqlx_Connection.Capability
+	// Set sets data to capability.
+	Set(any *Mysqlx_Datatypes.Any) bool
 }

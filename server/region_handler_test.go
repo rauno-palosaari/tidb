@@ -185,7 +185,7 @@ func (ts *TidbRegionHandlerTestSuite) startServer(c *C) {
 		Store:        "tikv",
 	}
 
-	server, err := NewServer(cfg, tidbdrv)
+	server, err := NewServer(cfg, tidbdrv, MysqlProtocol)
 	c.Assert(err, IsNil)
 	ts.server = server
 	go server.Run()

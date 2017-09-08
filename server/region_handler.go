@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/driver"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
@@ -89,12 +90,12 @@ const (
 // It would panic when any error happens.
 func (s *Server) newRegionHandler() (hanler *regionHandler) {
 	var tikvStore kvStore
-	store, ok := s.driver.(*TiDBDriver)
+	store, ok := s.driver.(*driver.TiDBDriver)
 	if !ok {
 		panic("Invalid KvStore with illegal driver")
 	}
 
-	if tikvStore, ok = store.store.(kvStore); !ok {
+	if tikvStore, ok = store.Store.(kvStore); !ok {
 		panic("Invalid KvStore with illegal store")
 	}
 

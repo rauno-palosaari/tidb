@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package server
+package driver
 
 import (
 	"github.com/pingcap/tidb/util/arena"
@@ -39,27 +39,27 @@ func (column *ColumnInfo) Dump(alloc arena.Allocator) []byte {
 
 	data := make([]byte, 0, l)
 
-	data = append(data, dumpLengthEncodedString([]byte("def"), alloc)...)
+	data = append(data, DumpLengthEncodedString([]byte("def"), alloc)...)
 
-	data = append(data, dumpLengthEncodedString([]byte(column.Schema), alloc)...)
+	data = append(data, DumpLengthEncodedString([]byte(column.Schema), alloc)...)
 
-	data = append(data, dumpLengthEncodedString([]byte(column.Table), alloc)...)
-	data = append(data, dumpLengthEncodedString([]byte(column.OrgTable), alloc)...)
+	data = append(data, DumpLengthEncodedString([]byte(column.Table), alloc)...)
+	data = append(data, DumpLengthEncodedString([]byte(column.OrgTable), alloc)...)
 
-	data = append(data, dumpLengthEncodedString([]byte(column.Name), alloc)...)
-	data = append(data, dumpLengthEncodedString([]byte(column.OrgName), alloc)...)
+	data = append(data, DumpLengthEncodedString([]byte(column.Name), alloc)...)
+	data = append(data, DumpLengthEncodedString([]byte(column.OrgName), alloc)...)
 
 	data = append(data, 0x0c)
 
-	data = append(data, dumpUint16(column.Charset)...)
-	data = append(data, dumpUint32(column.ColumnLength)...)
+	data = append(data, DumpUint16(column.Charset)...)
+	data = append(data, DumpUint32(column.ColumnLength)...)
 	data = append(data, column.Type)
-	data = append(data, dumpUint16(column.Flag)...)
+	data = append(data, DumpUint16(column.Flag)...)
 	data = append(data, column.Decimal)
 	data = append(data, 0, 0)
 
 	if column.DefaultValue != nil {
-		data = append(data, dumpUint64(uint64(len(column.DefaultValue)))...)
+		data = append(data, DumpUint64(uint64(len(column.DefaultValue)))...)
 		data = append(data, []byte(column.DefaultValue)...)
 	}
 

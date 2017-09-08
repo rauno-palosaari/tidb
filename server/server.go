@@ -44,6 +44,7 @@ import (
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/arena"
+	"github.com/pingcap/tidb/driver"
 )
 
 var (
@@ -59,14 +60,22 @@ var (
 	errAccessDenied      = terror.ClassServer.New(codeAccessDenied, mysql.MySQLErrName[mysql.ErrAccessDenied])
 )
 
+const (
+	// MysqlProtocol is MySQL Protocol
+	MysqlProtocol  = 1
+	// MysqlXProtocol is MySQL X Protocol
+	MysqlXProtocol = 2
+)
+
 // Server is the MySQL protocol server
 type Server struct {
 	cfg               *config.Config
-	driver            IDriver
+	driver            driver.IDriver
 	listener          net.Listener
 	rwlock            *sync.RWMutex
 	concurrentLimiter *TokenLimiter
-	clients           map[uint32]*clientConn
+	typ               int
+	clients           map[uint32] clientConn
 
 	// When a critical error occurred, we don't want to exit the process, because there may be
 	// a supervisor automatically restart it, then new client connection will be created, but we can't server it.
@@ -91,10 +100,10 @@ func (s *Server) releaseToken(token *Token) {
 	s.concurrentLimiter.Put(token)
 }
 
-// newConn creates a new *clientConn from a net.Conn.
+// newConn creates a new *ClientConn from a net.Conn.
 // It allocates a connection ID and random salt data for authentication.
-func (s *Server) newConn(conn net.Conn) *clientConn {
-	cc := &clientConn{
+func (s *Server) newConn(conn net.Conn) *mysqlClientConn {
+	cc := &mysqlClientConn{
 		conn:         conn,
 		pkt:          newPacketIO(conn),
 		server:       s,
@@ -110,7 +119,7 @@ func (s *Server) newConn(conn net.Conn) *clientConn {
 			}
 		}
 	}
-	cc.salt = util.RandomBuf(20)
+	cc.salt = util.RandomBuf(mysql.ScrambleLength)
 	return cc
 }
 
@@ -121,25 +130,35 @@ func (s *Server) skipAuth() bool {
 const tokenLimit = 1000
 
 // NewServer creates a new Server.
-func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
+func NewServer(cfg *config.Config, driver driver.IDriver, serverType int) (*Server, error) {
 	s := &Server{
 		cfg:               cfg,
 		driver:            driver,
 		concurrentLimiter: NewTokenLimiter(tokenLimit),
 		rwlock:            &sync.RWMutex{},
-		clients:           make(map[uint32]*clientConn),
+		typ:               serverType,
+		clients:           make(map[uint32]clientConn),
 		stopListenerCh:    make(chan struct{}, 1),
 	}
 
+	socket := cfg.Socket
+	addr := s.cfg.Addr
+	protocol := "MySQL"
+	if serverType == MysqlXProtocol {
+		socket = cfg.XSocket
+		addr   = cfg.XAddr
+		protocol = "MySQL X"
+	}
+
 	var err error
-	if cfg.Socket != "" {
+	if (serverType == MysqlProtocol && cfg.Socket != "") || (serverType == MysqlXProtocol && cfg.XSocket != "") {
 		cfg.SkipAuth = true
-		if s.listener, err = net.Listen("unix", cfg.Socket); err == nil {
-			log.Infof("Server is running MySQL Protocol through Socket [%s]", cfg.Socket)
+		if s.listener, err = net.Listen("unix", socket); err == nil {
+		        log.Infof("Server is running %s Protocol through Socket [%s]", protocol, socket)
 		}
 	} else {
-		if s.listener, err = net.Listen("tcp", s.cfg.Addr); err == nil {
-			log.Infof("Server is running MySQL Protocol at [%s]", s.cfg.Addr)
+		if s.listener, err = net.Listen("tcp", addr); err == nil {
+			log.Infof("Server is running %s Protocol at [%s]", protocol, addr)
 		}
 	}
 	if err != nil {
@@ -158,7 +177,9 @@ func (s *Server) Run() error {
 		s.startStatusHTTP()
 	}
 	for {
+		log.Infof("[YUSP] ready to accept connection")
 		conn, err := s.listener.Accept()
+		log.Infof("[YUSP] new connection")
 		if err != nil {
 			if opErr, ok := err.(*net.OpError); ok {
 				if opErr.Err.Error() == "use of closed network connection" {
@@ -172,6 +193,7 @@ func (s *Server) Run() error {
 			conn.Close()
 			break
 		}
+		log.Infof("[YUSP] ready connection")
 		go s.onConn(conn)
 	}
 	s.listener.Close()
@@ -204,11 +226,12 @@ func (s *Server) Close() {
 
 // onConn runs in its own goroutine, handles queries from this connection.
 func (s *Server) onConn(c net.Conn) {
-	conn := s.newConn(c)
+	conn := createClientConn(c, s)
 	defer func() {
-		log.Infof("[%d] close connection", conn.connectionID)
+		log.Infof("[%d] close connection", conn.id())
 	}()
 
+	log.Infof("[YUSP] before handshake")
 	if err := conn.handshake(); err != nil {
 		// Some keep alive services will send request to TiDB and disconnect immediately.
 		// So we use info log level.
@@ -218,7 +241,7 @@ func (s *Server) onConn(c net.Conn) {
 	}
 
 	s.rwlock.Lock()
-	s.clients[conn.connectionID] = conn
+	s.clients[conn.id()] = conn
 	connections := len(s.clients)
 	s.rwlock.Unlock()
 	connGauge.Set(float64(connections))
@@ -231,10 +254,10 @@ func (s *Server) ShowProcessList() []util.ProcessInfo {
 	var rs []util.ProcessInfo
 	s.rwlock.RLock()
 	for _, client := range s.clients {
-		if client.killed {
+		if client.isKilled() {
 			continue
 		}
-		rs = append(rs, client.ctx.ShowProcess())
+		rs = append(rs, client.showProcess())
 	}
 	s.rwlock.RUnlock()
 	return rs
@@ -250,10 +273,7 @@ func (s *Server) Kill(connectionID uint64, query bool) {
 		return
 	}
 
-	conn.ctx.Cancel()
-	if !query {
-		conn.killed = true
-	}
+	conn.Cancel(query)
 }
 
 // Server error codes.
